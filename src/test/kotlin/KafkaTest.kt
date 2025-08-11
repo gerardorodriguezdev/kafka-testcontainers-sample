@@ -11,65 +11,72 @@ import org.testcontainers.utility.DockerImageName
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
+import kotlin.test.assertEquals
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.toJavaDuration
 
 @Testcontainers
 class KafkaTest {
-
-    @Test
-    fun test() {
-        val producerProps = mapOf<String, String>(
+    private val producerProps = mapOf<String, String>(
+        "bootstrap.servers" to kafka.bootstrapServers,
+        "key.serializer" to "org.apache.kafka.common.serialization.StringSerializer",
+        "value.serializer" to "org.apache.kafka.common.serialization.ByteArraySerializer",
+        "security.protocol" to "PLAINTEXT"
+    )
+    private val consumerProps =
+        mapOf(
             "bootstrap.servers" to kafka.bootstrapServers,
-            "key.serializer" to "org.apache.kafka.common.serialization.StringSerializer",
-            "value.serializer" to "org.apache.kafka.common.serialization.ByteArraySerializer",
+            "auto.offset.reset" to "earliest",
+            "key.deserializer" to "org.apache.kafka.common.serialization.StringDeserializer",
+            "value.deserializer" to "org.apache.kafka.common.serialization.ByteArrayDeserializer",
+            "group.id" to "someGroup",
             "security.protocol" to "PLAINTEXT"
         )
-        val consumerProps =
-            mapOf(
-                "bootstrap.servers" to kafka.bootstrapServers,
-                "auto.offset.reset" to "earliest",
-                "key.deserializer" to "org.apache.kafka.common.serialization.StringDeserializer",
-                "value.deserializer" to "org.apache.kafka.common.serialization.ByteArrayDeserializer",
-                "group.id" to "someGroup",
-                "security.protocol" to "PLAINTEXT"
-            )
+
+    @Test
+    fun consumerProducerTest() = runBlocking {
+        val consumer = KafkaConsumer<String, ByteArray>(consumerProps)
+        val consumerJob = launch {
+            consumer.use { consumer ->
+                consumer.subscribe(listOf(TOPIC_NAME))
+                val message = consumer.receive()
+                assertEquals(expected = MESSAGE, actual = message)
+            }
+        }
 
         val producer = KafkaProducer<String, ByteArray>(producerProps)
-        runBlocking {
-            val job = launch {
-                KafkaConsumer<String, ByteArray>(consumerProps).use { consumer ->
-                    consumer.subscribe(listOf("topic"))
-                    val message = repeatUntilSome {
-                        consumer.poll(400.milliseconds.toJavaDuration())
-                            .map { record -> String(record.value()) }
-                            .firstOrNull()
-                    }
-                    println(">>>" + message)
-                }
-            }
-
-            producer.use { producer ->
-                producer.sendAsync(ProducerRecord("topic", "Hi".encodeToByteArray()))
-            }
-
-            job.join()
+        producer.use { producer ->
+            producer.sendAsync(ProducerRecord(TOPIC_NAME, MESSAGE.encodeToByteArray()))
         }
+
+        consumerJob.join()
     }
 
-    private suspend fun KafkaProducer<String, ByteArray>.sendAsync(record: ProducerRecord<String, ByteArray>) {
-        suspendCoroutine { continuation ->
-            send(record) { metadata, exception ->
-                exception?.let { continuation.resumeWithException(it) } ?: continuation.resume(metadata)
-            }
-        }
-    }
+    private companion object {
+        const val TOPIC_NAME = "my-topic"
+        const val MESSAGE = "MyMessage"
+        const val IMAGE_NAME = "confluentinc/cp-kafka:6.2.1"
+        val pollTimeout = 400.milliseconds.toJavaDuration()
 
-    tailrec fun <T> repeatUntilSome(block: () -> T?): T = block() ?: repeatUntilSome(block)
-
-    companion object {
         @JvmStatic
         @Container
-        val kafka = KafkaContainer(DockerImageName.parse("confluentinc/cp-kafka:6.2.1"))
+        val kafka = KafkaContainer(DockerImageName.parse(IMAGE_NAME))
+
+        suspend fun KafkaProducer<String, ByteArray>.sendAsync(record: ProducerRecord<String, ByteArray>) {
+            suspendCoroutine { continuation ->
+                send(record) { metadata, exception ->
+                    if (exception != null) {
+                        continuation.resumeWithException(exception)
+                    } else {
+                        continuation.resume(metadata)
+                    }
+                }
+            }
+        }
+
+        tailrec fun KafkaConsumer<String, ByteArray>.receive(): String {
+            val message = poll(pollTimeout).map { record -> String(record.value()) }.firstOrNull()
+            return message ?: receive()
+        }
     }
 }
